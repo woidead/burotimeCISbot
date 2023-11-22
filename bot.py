@@ -1,22 +1,22 @@
-import logging
-import os
-import django
-from aiogram import Bot, Dispatcher, types
+import logging, os, django
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher.filters import Text
 from asgiref.sync import sync_to_async
+from bs4 import BeautifulSoup
+from config import token
+# Импортируйте ваши модели Django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'burotime_kg.settings')
+django.setup()
+from apps.products.models import Category, Product, Favorite
 
+API_TOKEN = token
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
 # Инициализация бота и диспетчера
-bot = Bot(token='6688411275:AAEVAkEGygPvRMgvTpg4uYkvMxE1iv5FX68')
+bot = Bot(token=API_TOKEN,parse_mode='Html')
 dp = Dispatcher(bot)
-
-# Настройка Django
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'burotime_kg.settings')
-django.setup()
-
-# Импорт моделей Django
-from apps.products.models import Category, Product, Favorite
 
 # Асинхронные функции для работы с моделями Django
 @sync_to_async
@@ -38,6 +38,11 @@ def get_product(product_id):
     return Product.objects.get(id=product_id)
 
 @sync_to_async
+def get_favorites_for_user(user_id):
+    favorites = Favorite.objects.filter(user_id=user_id).select_related('product')
+    return [(favorite.product.id, favorite.product.name) for favorite in favorites]
+
+@sync_to_async
 def add_to_favorites(user_id, product_id):
     product = Product.objects.get(id=product_id)
     Favorite.objects.get_or_create(user_id=user_id, product=product)
@@ -55,7 +60,7 @@ def is_favorite(user_id, product_id):
 # Команда старт
 @dp.message_handler(commands=['start'])
 async def send_welcome(message: types.Message):
-    await message.reply("Привет! Я бот-каталог магазина. Чем я могу вам помочь?")
+    await message.reply("Привет! Я бот бренда Burotime\n/categories - показать категории продукций\n/favorite - показать все избранные продукты")
 
 # Команда помощь
 @dp.message_handler(commands=['help'])
@@ -106,10 +111,14 @@ async def handle_category(callback_query: types.CallbackQuery):
     if total > page * 6:
         pagination_buttons.append(types.InlineKeyboardButton(text="➡️", callback_data=f"category:{category_id}:{page+1}"))
     
-    keyboard = types.InlineKeyboardMarkup(row_width=5)
-    keyboard.row(*product_buttons)
+    keyboard = types.InlineKeyboardMarkup()
+    for i in range(0, len(product_buttons), 3):
+        keyboard.row(*product_buttons[i:i+3])
+
     if pagination_buttons:
         keyboard.row(*pagination_buttons)
+    back_button = types.InlineKeyboardButton(text="Назад к категориям", callback_data="back_to_categories")
+    keyboard.add(back_button)
     
     await callback_query.message.edit_text(text, reply_markup=keyboard)
 
@@ -126,7 +135,24 @@ async def handle_product(callback_query: types.CallbackQuery):
     
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(*buttons)
-    await bot.send_message(callback_query.from_user.id, f"{product.name}\nЦена: {product.price}\n{product.description}", reply_markup=keyboard)
+    # back_button = types.InlineKeyboardButton(text="Назад к продуктам", callback_data=f"back_to_products:{product.category_id}")
+    # keyboard.add(back_button)
+    product_description = BeautifulSoup(product.description.html, 'html.parser').get_text()
+    caption = f"{product.name}\n{product_description}"
+    with open(product.image.path, 'rb') as photo:
+        await bot.send_photo(callback_query.from_user.id, photo=photo, caption=caption,reply_markup=keyboard)
+    # await bot.send_photo(callback_query.from_user.id, photo=product.image.url)
+    # await bot.send_message(callback_query.from_user.id, f"{product.name}\n{product.description}", reply_markup=keyboard)
+
+@dp.callback_query_handler(lambda c: c.data == 'back_to_categories')
+async def back_to_categories(callback_query: types.CallbackQuery):
+    await show_categories(callback_query.message)
+@dp.callback_query_handler(lambda c: c.data.startswith('back_to_products'))
+async def back_to_products(callback_query: types.CallbackQuery):
+    _, category_id = callback_query.data.split(':')
+    category_id = int(category_id)
+    await handle_category(callback_query.message, category_id, 1)  # Предполагается, что 1 - это страница
+
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('favorite:add:'))
 async def add_to_favorite(callback_query: types.CallbackQuery):
@@ -141,6 +167,21 @@ async def remove_from_favorite(callback_query: types.CallbackQuery):
     await remove_from_favorites(callback_query.from_user.id, product_id)
     product = await get_product(product_id)
     await bot.send_message(callback_query.from_user.id, f"{product.name} удален из избранного")
+
+
+
+@dp.message_handler(commands=['favorite'])
+async def list_favorites(message: types.Message):
+    user_id = message.from_user.id
+    favorites = await get_favorites_for_user(user_id)
+    if not favorites:
+        await message.answer("У вас пока нет избранных продуктов.")
+        return
+    
+    text = "Ваши избранные продукты:\n\n"
+    text += "\n".join([f"{i+1}. {name}" for i, (product_id, name) in enumerate(favorites)])
+    await message.answer(text)
+
 
 if __name__ == '__main__':
     from aiogram import executor
